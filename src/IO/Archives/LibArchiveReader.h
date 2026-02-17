@@ -45,6 +45,9 @@ public:
     std::vector<std::string> getAllFiles() override;
     std::vector<std::string> getAllFiles(NameFilter filter) override;
 
+    /// Streams all files sequentially. Efficient for tar archives (O(N) vs O(N²) for random access).
+    bool streamAllFiles(std::function<bool(const String & filename, ReadBuffer & read_buffer)> callback) override;
+
     /// Sets password used to decrypt the contents of the files in the archive.
     void setPassword(const String & password_) override;
 

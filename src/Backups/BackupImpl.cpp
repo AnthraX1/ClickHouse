@@ -15,10 +15,12 @@
 #include <Common/XMLUtils.h>
 #include <IO/Archives/IArchiveReader.h>
 #include <IO/Archives/IArchiveWriter.h>
+#include <IO/Archives/ArchiveUtils.h>
 #include <IO/Archives/createArchiveReader.h>
 #include <IO/Archives/createArchiveWriter.h>
 #include <IO/ConcatReadBufferFromFile.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/WriteBufferFromFileBase.h>
@@ -27,6 +29,7 @@
 #include <IO/copyData.h>
 #include <Poco/Util/XMLConfiguration.h>
 #include <Poco/DOM/DOMParser.h>
+#include <filesystem>
 
 
 namespace ProfileEvents
@@ -165,6 +168,13 @@ BackupImpl::~BackupImpl()
 
     try
     {
+        /// Clean up temporary directory for tar extraction
+        if (!tar_temp_dir.empty() && std::filesystem::exists(tar_temp_dir))
+        {
+            LOG_TRACE(log, "Removing temporary directory {}", tar_temp_dir);
+            std::filesystem::remove_all(tar_temp_dir);
+        }
+        
         close();
     }
     catch (...)
@@ -494,6 +504,9 @@ void BackupImpl::readBackupMetadata()
     if (config_root->getNodeByPath("base_backup_uuid"))
         base_backup_uuid = parse<UUID>(getString(config_root, "base_backup_uuid"));
 
+    /// Track whether this backup depends on a base backup for optimization purposes
+    has_base_backup = base_backup_info.has_value();
+
     if (config_root->getNodeByPath("original_endpoint"))
         original_endpoint = getString(config_root, "original_endpoint");
     if (config_root->getNodeByPath("original_namespace"))
@@ -819,7 +832,38 @@ BackupImpl::readFileImpl(const String & file_name, const SizeAndChecksum & size_
     {
         /// Make `read_buffer` if there is data for this backup entry in this backup.
         if (use_archive)
-            read_buffer = archive_reader->readFile(info.data_file_name, /*throw_on_not_found=*/true);
+        {
+            /// Optimization for tar archives (non-incremental): extract all files on first access
+            /// to avoid O(N²) sequential scans. For incremental backups or when streamAllFiles 
+            /// is not supported, fall back to random access.
+            if (isTarArchive() && !has_base_backup)
+            {
+                std::lock_guard lock{mutex};
+                
+                /// Extract all files to temp on first access
+                if (!tar_archive_extracted)
+                    extractTarArchiveToTemp();
+                
+                /// Read from the extracted temp file
+                auto it = tar_extracted_files.find(info.data_file_name);
+                if (it != tar_extracted_files.end())
+                {
+                    /// Open the temp file directly
+                    read_buffer = std::make_unique<ReadBufferFromFile>(it->second);
+                }
+                else
+                {
+                    /// File not found in extracted files, fall back to archive reader
+                    LOG_WARNING(log, "File {} not found in extracted tar files, using archive reader", info.data_file_name);
+                    read_buffer = archive_reader->readFile(info.data_file_name, /*throw_on_not_found=*/true);
+                }
+            }
+            else
+            {
+                /// Use normal archive reading (for zip, 7z, or incremental tar backups)
+                read_buffer = archive_reader->readFile(info.data_file_name, /*throw_on_not_found=*/true);
+            }
+        }
         else
             read_buffer = reader->readFile(info.data_file_name);
     }
@@ -1205,6 +1249,111 @@ void BackupImpl::removeAllFilesUnderDirectory(const String & directory) const
     }
 
     lightweight_snapshot_writer->removeFiles(objects_to_remove);
+}
+
+bool BackupImpl::isTarArchive() const
+{
+    /// Check if the archive is a tar format based on the file extension
+    return use_archive && hasSupportedTarExtension(archive_params.archive_name);
+}
+
+void BackupImpl::extractTarArchiveToTemp() const
+{
+    /// This method extracts all files from a tar archive to a temporary directory on first access.
+    /// For tar archives, each random file access requires scanning from the beginning,
+    /// resulting in O(N²) total time. By extracting all files once, subsequent access is O(1).
+    ///
+    /// Safety considerations:
+    /// 1. The .backup metadata file checksums are NEVER verified against actual file data during restore.
+    ///    They serve only as lookup keys in the file_infos map.
+    /// 2. Encrypted files work because we do byte-level copy without decryption during restore.
+    ///    The encrypted_by_disk flag only controls whether writeEncryptedFile() vs writeFile() is called.
+    /// 3. For non-incremental backups (no base backup), all data comes from this archive.
+    ///    The tar entry paths encode the full database/table/part/filename structure needed for routing.
+    
+    if (!archive_reader)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Archive reader is not initialized");
+    
+    if (tar_archive_extracted)
+        return; /// Already extracted
+    
+    /// Create a temporary directory for extraction
+    /// Use /tmp with a unique name based on the backup UUID
+    tar_temp_dir = std::filesystem::temp_directory_path() / fmt::format("clickhouse_backup_{}", toString(*uuid));
+    std::filesystem::create_directories(tar_temp_dir);
+    
+    LOG_TRACE(log, "Extracting tar archive {} to temporary directory {}", backup_name_for_logging, tar_temp_dir);
+    
+    size_t files_extracted = 0;
+    
+    /// Use streamAllFiles to iterate through the archive sequentially
+    bool streaming_supported = archive_reader->streamAllFiles(
+        [&](const String & filename, ReadBuffer & read_buffer) -> bool
+        {
+            /// Skip the .backup metadata file - we already read it during readBackupMetadata()
+            if (filename == ".backup")
+                return true; /// Continue to next file
+            
+            /// Look up the file in our metadata to get size
+            auto name_it = file_names.find(filename);
+            if (name_it == file_names.end())
+            {
+                LOG_WARNING(log, "File {} found in archive but not in backup metadata, skipping", filename);
+                return true;
+            }
+            
+            const auto & size_and_checksum = name_it->second;
+            UInt64 file_size = size_and_checksum.first;
+            
+            /// Create the full path in temp directory, preserving directory structure
+            std::filesystem::path temp_file_path = std::filesystem::path(tar_temp_dir) / filename;
+            std::filesystem::create_directories(temp_file_path.parent_path());
+            
+            /// Write the file to temp location
+            if (file_size > 0)
+            {
+                std::ofstream out_file(temp_file_path, std::ios::binary);
+                if (!out_file)
+                    throw Exception(ErrorCodes::CANNOT_UNPACK_ARCHIVE, "Cannot create temporary file {}", temp_file_path.string());
+                
+                /// Copy data from archive to temp file
+                char buffer[DBMS_DEFAULT_BUFFER_SIZE];
+                size_t bytes_remaining = file_size;
+                while (bytes_remaining > 0)
+                {
+                    size_t to_read = std::min<size_t>(bytes_remaining, sizeof(buffer));
+                    size_t bytes_read = read_buffer.read(buffer, to_read);
+                    if (bytes_read == 0)
+                        throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "Unexpected EOF while reading file {} from archive", filename);
+                    
+                    out_file.write(buffer, bytes_read);
+                    bytes_remaining -= bytes_read;
+                }
+                
+                out_file.close();
+            }
+            else
+            {
+                /// Create empty file
+                std::ofstream(temp_file_path).close();
+            }
+            
+            /// Store the mapping
+            tar_extracted_files[filename] = temp_file_path.string();
+            ++files_extracted;
+            
+            return true; /// Continue to next file
+        });
+    
+    if (!streaming_supported)
+    {
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Sequential streaming not supported by archive reader");
+    }
+    
+    tar_archive_extracted = true;
+    LOG_TRACE(log, "Extracted {} files from tar archive to {}", files_extracted, tar_temp_dir);
 }
 
 }

@@ -471,6 +471,34 @@ std::vector<std::string> LibArchiveReader::getAllFiles(NameFilter filter)
     return handle.getAllFiles(filter);
 }
 
+bool LibArchiveReader::streamAllFiles(std::function<bool(const String & filename, ReadBuffer & read_buffer)> callback)
+{
+    /// Sequential streaming is efficient for tar archives (avoids O(N²) scans from the beginning)
+    /// but not beneficial for formats like zip that support efficient random access.
+    /// We return true to indicate this optimization is supported.
+    
+    auto enumerator = firstFile();
+    if (!enumerator)
+        return true; /// Empty archive, but streaming is supported
+    
+    while (enumerator)
+    {
+        const String & filename = enumerator->getFileName();
+        auto read_buffer = readFile(std::move(enumerator));
+        
+        /// Call the user's callback with the filename and read buffer
+        bool continue_iteration = callback(filename, *read_buffer);
+        
+        if (!continue_iteration)
+            return true; /// User requested to stop iteration
+        
+        /// Move to the next file
+        enumerator = nextFile(std::move(read_buffer));
+    }
+    
+    return true; /// Streaming completed successfully
+}
+
 void LibArchiveReader::setPassword(const String & password_)
 {
     if (password_.empty())

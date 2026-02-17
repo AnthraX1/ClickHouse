@@ -127,6 +127,14 @@ private:
     std::unique_ptr<ReadBufferFromFileBase>
     readFileImpl(const String & file_name, const SizeAndChecksum & size_and_checksum, bool read_encrypted) const;
 
+    /// Checks if the archive is a tar format (which benefits from sequential reading)
+    bool isTarArchive() const;
+
+    /// Extracts all files from tar archive to a temporary location on first access.
+    /// This avoids O(N²) complexity of repeated sequential scans.
+    /// Called automatically by readFileImpl() or copyFileToDisk() when needed.
+    void extractTarArchiveToTemp() const TSA_REQUIRES(mutex);
+
     const BackupFactory::CreateParams params;
     BackupInfo backup_info;
     const String backup_name_for_logging;
@@ -171,10 +179,16 @@ private:
     mutable std::optional<BackupInfo> base_backup_info;
     mutable std::shared_ptr<const IBackup> base_backup;
     mutable std::optional<UUID> base_backup_uuid;
+    bool has_base_backup = false; /// Set during readBackupMetadata() if base_backup_info is present
     std::shared_ptr<IArchiveReader> archive_reader;
     std::shared_ptr<IArchiveWriter> archive_writer;
     String lock_file_name;
     std::atomic<bool> lock_file_before_first_file_checked = false;
+    
+    /// For tar archive optimization: tracks which files have been extracted via sequential streaming
+    mutable bool tar_archive_extracted = false TSA_GUARDED_BY(mutex);
+    mutable String tar_temp_dir TSA_GUARDED_BY(mutex); /// Temporary directory where tar files are extracted
+    mutable std::unordered_map<String, String> tar_extracted_files TSA_GUARDED_BY(mutex); /// filename -> temp_path
 
     bool writing_finalized = false;
     bool corrupted = false;

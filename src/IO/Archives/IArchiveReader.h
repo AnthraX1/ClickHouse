@@ -64,6 +64,18 @@ public:
     virtual std::vector<std::string> getAllFiles() = 0;
     virtual std::vector<std::string> getAllFiles(NameFilter filter) = 0;
 
+    /// Streams all files in the archive sequentially, calling the callback for each file.
+    /// The callback receives the filename and a ReadBuffer containing the file's data.
+    /// Returns false to stop iteration, or true to continue to the next file.
+    /// Returns true if this archive format supports sequential streaming (e.g., tar),
+    /// or false if this optimization is not applicable (e.g., zip has efficient random access).
+    /// This method is useful for tar archives where random access requires O(N) scan for each file,
+    /// leading to O(N²) total complexity. Sequential streaming achieves O(N) complexity.
+    virtual bool streamAllFiles(std::function<bool(const String & filename, ReadBuffer & read_buffer)> /* callback */)
+    {
+        return false; // Default: not supported
+    }
+
     /// Sets password used to decrypt files in the archive.
     virtual void setPassword(const String & /* password */) {}
 
