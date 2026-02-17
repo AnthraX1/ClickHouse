@@ -942,34 +942,42 @@ size_t BackupImpl::copyFileToDisk(const SizeAndChecksum & size_and_checksum,
             info.data_file_name);
     }
 
-    /// Optimization for tar archives without base backup: batch all file copy requests
-    /// and process them in a single sequential pass to avoid O(N²) complexity.
+    /// Optimization for tar archives without base backup: do a single sequential pass
+    /// to copy all files from the archive in ONE thread to avoid O(N²) complexity.
     if (use_archive && isTarArchive() && !has_base_backup && info.size > info.base_size)
     {
-        std::lock_guard lock{mutex};
+        std::unique_lock lock{mutex};
         
-        /// If sequential copy hasn't been done yet, add this file to pending list
-        if (!tar_sequential_copy_done)
+        /// Add this file to the pending list
+        PendingFileRestore pending;
+        pending.destination_disk = destination_disk;
+        pending.destination_path = destination_path;
+        pending.write_mode = write_mode;
+        pending.info = info;
+        tar_pending_files[info.data_file_name] = std::move(pending);
+        
+        /// If sequential copy hasn't started and isn't done, start it
+        if (!tar_sequential_copy_done && !tar_sequential_copy_in_progress)
         {
-            PendingFileRestore pending;
-            pending.destination_disk = destination_disk;
-            pending.destination_path = destination_path;
-            pending.write_mode = write_mode;
-            pending.info = info;
+            /// This thread will perform the sequential copy
+            tar_sequential_copy_in_progress = true;
             
-            tar_pending_files[info.data_file_name] = std::move(pending);
-            
-            /// Trigger sequential copy when we've accumulated files
-            /// For simplicity, do it on every call - the method will only execute once
+            /// Perform sequential copy in this thread only
             copyPendingFilesFromTarSequentially();
             
-            /// After sequential copy, the file is already written
-            ++num_read_files;
-            num_read_bytes += info.size;
-            return info.size;
+            tar_sequential_copy_done = true;
+            tar_sequential_copy_in_progress = false;
+            
+            /// Notify any waiting threads (though in practice there shouldn't be many)
+            tar_copy_cv.notify_all();
         }
-        /// If sequential copy was already done, this file should have been copied
-        /// Just update counters and return
+        else if (tar_sequential_copy_in_progress)
+        {
+            /// Another thread is doing the sequential copy, wait for it to complete
+            tar_copy_cv.wait(lock, [this] { return tar_sequential_copy_done; });
+        }
+        
+        /// After sequential copy completes, the file is already written
         ++num_read_files;
         num_read_bytes += info.size;
         return info.size;

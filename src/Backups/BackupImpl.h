@@ -7,6 +7,7 @@
 #include <Backups/BackupInfo.h>
 #include <map>
 #include <mutex>
+#include <condition_variable>
 
 
 namespace DB
@@ -156,6 +157,7 @@ private:
     std::shared_ptr<IBackupCoordination> coordination;
 
     mutable std::mutex mutex;
+    mutable std::condition_variable tar_copy_cv; /// For coordinating tar sequential copy between threads
 
     using SizeAndChecksum = std::pair<UInt64, UInt128>;
     std::map<String /* file_name */, SizeAndChecksum> file_names TSA_GUARDED_BY(mutex); /// Should be ordered alphabetically, see listFiles(). For empty files we assume checksum = 0.
@@ -192,7 +194,8 @@ private:
         WriteMode write_mode;
         BackupFileInfo info;
     };
-    mutable bool tar_sequential_copy_done = false TSA_GUARDED_BY(mutex);
+    mutable bool tar_sequential_copy_in_progress = false TSA_GUARDED_BY(mutex); /// True while one thread is doing sequential copy
+    mutable bool tar_sequential_copy_done = false TSA_GUARDED_BY(mutex); /// True after sequential copy completes
     mutable std::unordered_map<String, PendingFileRestore> tar_pending_files TSA_GUARDED_BY(mutex);
 
     bool writing_finalized = false;
