@@ -130,10 +130,9 @@ private:
     /// Checks if the archive is a tar format (which benefits from sequential reading)
     bool isTarArchive() const;
 
-    /// Extracts all files from tar archive to a temporary location on first access.
-    /// This avoids O(N²) complexity of repeated sequential scans.
-    /// Called automatically by readFileImpl() or copyFileToDisk() when needed.
-    void extractTarArchiveToTemp() const TSA_REQUIRES(mutex);
+    /// For tar archives: performs a single sequential pass to copy all pending files to their destinations.
+    /// This avoids O(N²) complexity of repeated sequential scans through the tar archive.
+    void copyPendingFilesFromTarSequentially() const TSA_REQUIRES(mutex);
 
     const BackupFactory::CreateParams params;
     BackupInfo backup_info;
@@ -185,10 +184,16 @@ private:
     String lock_file_name;
     std::atomic<bool> lock_file_before_first_file_checked = false;
     
-    /// For tar archive optimization: tracks which files have been extracted via sequential streaming
-    mutable bool tar_archive_extracted = false TSA_GUARDED_BY(mutex);
-    mutable String tar_temp_dir TSA_GUARDED_BY(mutex); /// Temporary directory where tar files are extracted
-    mutable std::unordered_map<String, String> tar_extracted_files TSA_GUARDED_BY(mutex); /// filename -> temp_path
+    /// For tar archive optimization: tracks files that need to be copied and their destinations
+    struct PendingFileRestore
+    {
+        DiskPtr destination_disk;
+        String destination_path;
+        WriteMode write_mode;
+        BackupFileInfo info;
+    };
+    mutable bool tar_sequential_copy_done = false TSA_GUARDED_BY(mutex);
+    mutable std::unordered_map<String, PendingFileRestore> tar_pending_files TSA_GUARDED_BY(mutex);
 
     bool writing_finalized = false;
     bool corrupted = false;

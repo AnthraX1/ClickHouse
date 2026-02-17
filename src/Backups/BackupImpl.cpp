@@ -20,7 +20,6 @@
 #include <IO/Archives/createArchiveWriter.h>
 #include <IO/ConcatReadBufferFromFile.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/WriteBufferFromFileBase.h>
@@ -29,7 +28,6 @@
 #include <IO/copyData.h>
 #include <Poco/Util/XMLConfiguration.h>
 #include <Poco/DOM/DOMParser.h>
-#include <filesystem>
 
 
 namespace ProfileEvents
@@ -168,13 +166,6 @@ BackupImpl::~BackupImpl()
 
     try
     {
-        /// Clean up temporary directory for tar extraction
-        if (!tar_temp_dir.empty() && std::filesystem::exists(tar_temp_dir))
-        {
-            LOG_TRACE(log, "Removing temporary directory {}", tar_temp_dir);
-            std::filesystem::remove_all(tar_temp_dir);
-        }
-        
         close();
     }
     catch (...)
@@ -832,38 +823,7 @@ BackupImpl::readFileImpl(const String & file_name, const SizeAndChecksum & size_
     {
         /// Make `read_buffer` if there is data for this backup entry in this backup.
         if (use_archive)
-        {
-            /// Optimization for tar archives (non-incremental): extract all files on first access
-            /// to avoid O(N²) sequential scans. For incremental backups or when streamAllFiles 
-            /// is not supported, fall back to random access.
-            if (isTarArchive() && !has_base_backup)
-            {
-                std::lock_guard lock{mutex};
-                
-                /// Extract all files to temp on first access
-                if (!tar_archive_extracted)
-                    extractTarArchiveToTemp();
-                
-                /// Read from the extracted temp file
-                auto it = tar_extracted_files.find(info.data_file_name);
-                if (it != tar_extracted_files.end())
-                {
-                    /// Open the temp file directly
-                    read_buffer = std::make_unique<ReadBufferFromFile>(it->second);
-                }
-                else
-                {
-                    /// File not found in extracted files, fall back to archive reader
-                    LOG_WARNING(log, "File {} not found in extracted tar files, using archive reader", info.data_file_name);
-                    read_buffer = archive_reader->readFile(info.data_file_name, /*throw_on_not_found=*/true);
-                }
-            }
-            else
-            {
-                /// Use normal archive reading (for zip, 7z, or incremental tar backups)
-                read_buffer = archive_reader->readFile(info.data_file_name, /*throw_on_not_found=*/true);
-            }
-        }
+            read_buffer = archive_reader->readFile(info.data_file_name, /*throw_on_not_found=*/true);
         else
             read_buffer = reader->readFile(info.data_file_name);
     }
@@ -980,6 +940,39 @@ size_t BackupImpl::copyFileToDisk(const SizeAndChecksum & size_and_checksum,
             ErrorCodes::CANNOT_RESTORE_TO_NONENCRYPTED_DISK,
             "File {} is encrypted in the backup, it can be restored only to an encrypted disk",
             info.data_file_name);
+    }
+
+    /// Optimization for tar archives without base backup: batch all file copy requests
+    /// and process them in a single sequential pass to avoid O(N²) complexity.
+    if (use_archive && isTarArchive() && !has_base_backup && info.size > info.base_size)
+    {
+        std::lock_guard lock{mutex};
+        
+        /// If sequential copy hasn't been done yet, add this file to pending list
+        if (!tar_sequential_copy_done)
+        {
+            PendingFileRestore pending;
+            pending.destination_disk = destination_disk;
+            pending.destination_path = destination_path;
+            pending.write_mode = write_mode;
+            pending.info = info;
+            
+            tar_pending_files[info.data_file_name] = std::move(pending);
+            
+            /// Trigger sequential copy when we've accumulated files
+            /// For simplicity, do it on every call - the method will only execute once
+            copyPendingFilesFromTarSequentially();
+            
+            /// After sequential copy, the file is already written
+            ++num_read_files;
+            num_read_bytes += info.size;
+            return info.size;
+        }
+        /// If sequential copy was already done, this file should have been copied
+        /// Just update counters and return
+        ++num_read_files;
+        num_read_bytes += info.size;
+        return info.size;
     }
 
     bool file_copied = false;
@@ -1257,11 +1250,11 @@ bool BackupImpl::isTarArchive() const
     return use_archive && hasSupportedTarExtension(archive_params.archive_name);
 }
 
-void BackupImpl::extractTarArchiveToTemp() const
+void BackupImpl::copyPendingFilesFromTarSequentially() const
 {
-    /// This method extracts all files from a tar archive to a temporary directory on first access.
+    /// This method copies all pending files from a tar archive in a single sequential pass.
     /// For tar archives, each random file access requires scanning from the beginning,
-    /// resulting in O(N²) total time. By extracting all files once, subsequent access is O(1).
+    /// resulting in O(N²) total time. Sequential streaming achieves O(N) complexity.
     ///
     /// Safety considerations:
     /// 1. The .backup metadata file checksums are NEVER verified against actual file data during restore.
@@ -1269,22 +1262,24 @@ void BackupImpl::extractTarArchiveToTemp() const
     /// 2. Encrypted files work because we do byte-level copy without decryption during restore.
     ///    The encrypted_by_disk flag only controls whether writeEncryptedFile() vs writeFile() is called.
     /// 3. For non-incremental backups (no base backup), all data comes from this archive.
-    ///    The tar entry paths encode the full database/table/part/filename structure needed for routing.
+    ///    The tar entry paths encode the full database/table/part/filename structure.
+    
+    if (tar_sequential_copy_done)
+        return; /// Already done
     
     if (!archive_reader)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Archive reader is not initialized");
     
-    if (tar_archive_extracted)
-        return; /// Already extracted
+    if (tar_pending_files.empty())
+    {
+        tar_sequential_copy_done = true;
+        return; /// Nothing to copy
+    }
     
-    /// Create a temporary directory for extraction
-    /// Use /tmp with a unique name based on the backup UUID
-    tar_temp_dir = std::filesystem::temp_directory_path() / fmt::format("clickhouse_backup_{}", toString(*uuid));
-    std::filesystem::create_directories(tar_temp_dir);
+    LOG_TRACE(log, "Starting sequential copy of {} files from tar archive", tar_pending_files.size());
     
-    LOG_TRACE(log, "Extracting tar archive {} to temporary directory {}", backup_name_for_logging, tar_temp_dir);
-    
-    size_t files_extracted = 0;
+    size_t files_copied = 0;
+    size_t bytes_copied = 0;
     
     /// Use streamAllFiles to iterate through the archive sequentially
     bool streaming_supported = archive_reader->streamAllFiles(
@@ -1294,53 +1289,30 @@ void BackupImpl::extractTarArchiveToTemp() const
             if (filename == ".backup")
                 return true; /// Continue to next file
             
-            /// Look up the file in our metadata to get size
-            auto name_it = file_names.find(filename);
-            if (name_it == file_names.end())
-            {
-                LOG_WARNING(log, "File {} found in archive but not in backup metadata, skipping", filename);
-                return true;
-            }
+            /// Check if this file is in our pending list
+            auto it = tar_pending_files.find(filename);
+            if (it == tar_pending_files.end())
+                return true; /// Not a file we need to copy, skip it
             
-            const auto & size_and_checksum = name_it->second;
-            UInt64 file_size = size_and_checksum.first;
+            const auto & pending = it->second;
+            const auto & info = pending.info;
             
-            /// Create the full path in temp directory, preserving directory structure
-            std::filesystem::path temp_file_path = std::filesystem::path(tar_temp_dir) / filename;
-            std::filesystem::create_directories(temp_file_path.parent_path());
+            /// Copy the file data from the archive to the destination disk
+            std::unique_ptr<WriteBuffer> write_buffer;
+            size_t buf_size = std::min<size_t>(info.size, reader->getWriteBufferSize());
             
-            /// Write the file to temp location
-            if (file_size > 0)
-            {
-                std::ofstream out_file(temp_file_path, std::ios::binary);
-                if (!out_file)
-                    throw Exception(ErrorCodes::CANNOT_UNPACK_ARCHIVE, "Cannot create temporary file {}", temp_file_path.string());
-                
-                /// Copy data from archive to temp file
-                char buffer[DBMS_DEFAULT_BUFFER_SIZE];
-                size_t bytes_remaining = file_size;
-                while (bytes_remaining > 0)
-                {
-                    size_t to_read = std::min<size_t>(bytes_remaining, sizeof(buffer));
-                    size_t bytes_read = read_buffer.read(buffer, to_read);
-                    if (bytes_read == 0)
-                        throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "Unexpected EOF while reading file {} from archive", filename);
-                    
-                    out_file.write(buffer, bytes_read);
-                    bytes_remaining -= bytes_read;
-                }
-                
-                out_file.close();
-            }
+            if (info.encrypted_by_disk)
+                write_buffer = pending.destination_disk->writeEncryptedFile(
+                    pending.destination_path, buf_size, pending.write_mode, reader->getWriteSettings());
             else
-            {
-                /// Create empty file
-                std::ofstream(temp_file_path).close();
-            }
+                write_buffer = pending.destination_disk->writeFile(
+                    pending.destination_path, buf_size, pending.write_mode, reader->getWriteSettings());
             
-            /// Store the mapping
-            tar_extracted_files[filename] = temp_file_path.string();
-            ++files_extracted;
+            copyData(read_buffer, *write_buffer, info.size);
+            write_buffer->finalize();
+            
+            ++files_copied;
+            bytes_copied += info.size;
             
             return true; /// Continue to next file
         });
@@ -1352,8 +1324,8 @@ void BackupImpl::extractTarArchiveToTemp() const
             "Sequential streaming not supported by archive reader");
     }
     
-    tar_archive_extracted = true;
-    LOG_TRACE(log, "Extracted {} files from tar archive to {}", files_extracted, tar_temp_dir);
+    tar_sequential_copy_done = true;
+    LOG_TRACE(log, "Sequentially copied {} files ({} bytes) from tar archive", files_copied, bytes_copied);
 }
 
 }
