@@ -129,6 +129,10 @@ protected:
     std::atomic<bool> exception_caught = false;
     ThreadPool & thread_pool;
     mutable std::mutex mutex;
+    
+    /// Buffered metadata files for tar archives (path -> SQL content)
+    /// Used when restoring from tar archives to avoid reading metadata files individually
+    std::optional<std::map<String, String>> buffered_metadata_files TSA_GUARDED_BY(mutex);
 };
 
 }

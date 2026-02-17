@@ -964,9 +964,63 @@ size_t BackupImpl::copyFileToDisk(const SizeAndChecksum & size_and_checksum,
         ++num_read_files;
         num_read_bytes += info.size;
     }
+    else if (tar_sequential_mode && info.size > info.base_size)
+    {
+        /// Tar sequential mode: advance the shared enumerator to find the file,
+        /// then copy directly from the streaming position — O(1) amortized.
+        if (!advanceTarEnumeratorTo(info.data_file_name))
+        {
+            /// File not found ahead in the tar. This can happen with de-duplicated entries
+            /// (multiple backup paths map to the same data_file_name, which appears only once
+            /// in the tar). Fall back to the standard O(N) seek-from-start path.
+            LOG_TRACE(log, "Sequential tar: {} not found ahead, falling back to random access", info.data_file_name);
+            auto read_buffer = readFileImpl(info.file_name, size_and_checksum, info.encrypted_by_disk);
+            std::unique_ptr<WriteBuffer> write_buffer;
+            size_t buf_size = std::min<size_t>(info.size, reader->getWriteBufferSize());
+            if (info.encrypted_by_disk)
+                write_buffer = destination_disk->writeEncryptedFile(destination_path, buf_size, write_mode, reader->getWriteSettings());
+            else
+                write_buffer = destination_disk->writeFile(destination_path, buf_size, write_mode, reader->getWriteSettings());
+            copyData(*read_buffer, *write_buffer, info.size);
+            write_buffer->finalize();
+        }
+        else
+        {
+            /// Found the file at the current enumerator position.
+            /// Handle base backup portion first if this is an incremental file.
+            if (info.base_size)
+            {
+                getBaseBackup()->copyFileToDisk(
+                    std::pair{info.base_size, info.base_checksum},
+                    destination_disk, destination_path, WriteMode::Rewrite);
+            }
+
+            /// Read this file's data from the tar via the enumerator.
+            auto tar_read_buffer = archive_reader->readFile(std::move(tar_enumerator));
+            size_t data_size = info.size - info.base_size;
+            size_t buf_size = std::min<size_t>(data_size, reader->getWriteBufferSize());
+            WriteMode wm = info.base_size ? WriteMode::Append : write_mode;
+
+            std::unique_ptr<WriteBuffer> write_buffer;
+            if (info.encrypted_by_disk)
+                write_buffer = destination_disk->writeEncryptedFile(destination_path, buf_size, wm, reader->getWriteSettings());
+            else
+                write_buffer = destination_disk->writeFile(destination_path, buf_size, wm, reader->getWriteSettings());
+
+            copyData(*tar_read_buffer, *write_buffer, data_size);
+            write_buffer->finalize();
+
+            /// Advance enumerator to the next file for the next copyFileToDisk() call.
+            tar_enumerator = archive_reader->nextFile(std::move(tar_read_buffer));
+        }
+
+        std::lock_guard lock{mutex};
+        ++num_read_files;
+        num_read_bytes += info.size;
+    }
     else
     {
-        /// Use the generic way to copy data. `readFile()` will update `num_read_files`.
+        /// Standard generic path: readFileImpl() opens a new archive handle and seeks.
         auto read_buffer = readFileImpl(info.file_name, size_and_checksum, /* read_encrypted= */ info.encrypted_by_disk);
         std::unique_ptr<WriteBuffer> write_buffer;
         size_t buf_size = std::min<size_t>(info.size, reader->getWriteBufferSize());
@@ -1217,125 +1271,97 @@ bool BackupImpl::isTarArchive() const
     return use_archive && hasSupportedTarExtension(archive_params.archive_name);
 }
 
-size_t BackupImpl::restoreFromTarArchive(DiskPtr destination_disk, const String & destination_prefix) const
+void BackupImpl::restoreFromTarArchive(MetadataReadyCallback on_metadata_ready) const
 {
-    /// This method provides a dedicated restore path for tar archives that uses
-    /// LibArchiveReader to sequentially extract files directly to their destinations.
-    /// This avoids O(N²) complexity of repeated sequential scans through the tar archive.
+    /// Single-pass tar restore for metadata, plus positioning for sequential data reads.
     ///
-    /// The tar archive contains files with paths like:
-    ///   - metadata/database/table.sql
-    ///   - data/database/table/part/data.bin
-    /// 
-    /// We extract each file to: destination_disk/destination_prefix/{tar_path}
+    /// Tar archives produced by ClickHouse have a guaranteed ordering:
+    ///   1. .backup          (XML metadata — already consumed by readBackupMetadata())
+    ///   2. metadata/*.sql   (database and table definitions)
+    ///   3. data/**          (table data files)
     ///
-    /// Safety considerations:
-    /// 1. The .backup metadata file checksums are NEVER verified against actual file data during restore.
-    ///    They serve only as lookup keys in the file_infos map.
-    /// 2. Encrypted files work because we do byte-level copy without decryption during restore.
-    ///    The encrypted_by_disk flag only controls whether writeEncryptedFile() vs writeFile() is called.
-    /// 3. For non-incremental backups (no base backup), all data comes from this archive.
-    
+    /// We iterate through the tar with firstFile()/nextFile(), buffering every .sql
+    /// file we encounter.  When we hit the first non-metadata entry we call
+    /// on_metadata_ready so the caller can create databases and tables.
+    /// We then leave the enumerator positioned at the first data file and enable
+    /// tar_sequential_mode so that subsequent copyFileToDisk() calls advance the
+    /// same enumerator forward instead of opening a fresh handle each time.
+
     if (open_mode == OpenMode::WRITE)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot restore from a backup opened for writing");
-    
+
     if (!use_archive || !isTarArchive())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "restoreFromTarArchive() called on non-tar backup");
-    
-    if (has_base_backup)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "restoreFromTarArchive() does not support incremental backups");
-    
+
     if (!archive_reader)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Archive reader is not initialized");
-    
-    LOG_INFO(log, "Starting sequential tar restore to {}{}", destination_disk->getName(), destination_prefix);
-    
-    size_t files_restored = 0;
-    size_t bytes_restored = 0;
-    
-    /// Use streamAllFiles to iterate through the tar archive sequentially (single pass)
-    bool streaming_supported = archive_reader->streamAllFiles(
-        [&](const String & filename, ReadBuffer & read_buffer) -> bool
-        {
-            /// Skip the .backup metadata file - we already read it during readBackupMetadata()
-            if (filename == ".backup")
-                return true; /// Continue to next file
-            
-            /// Look up the file in our metadata to get size and encryption info
-            std::lock_guard lock{mutex};
-            
-            auto name_it = file_names.find(filename);
-            if (name_it == file_names.end())
-            {
-                LOG_WARNING(log, "File {} found in tar but not in backup metadata, skipping", filename);
-                return true;
-            }
-            
-            const auto & size_and_checksum = name_it->second;
-            UInt64 file_size = size_and_checksum.first;
-            
-            /// Get file info for encryption flag
-            bool encrypted_by_disk = false;
-            if (file_size > 0)
-            {
-                auto info_it = file_infos.find(size_and_checksum);
-                if (info_it != file_infos.end())
-                    encrypted_by_disk = info_it->second.encrypted_by_disk;
-            }
-            
-            /// Check encryption compatibility
-            if (encrypted_by_disk && !destination_disk->getDataSourceDescription().is_encrypted)
-            {
-                throw Exception(
-                    ErrorCodes::CANNOT_RESTORE_TO_NONENCRYPTED_DISK,
-                    "File {} is encrypted in the backup, it can be restored only to an encrypted disk",
-                    filename);
-            }
-            
-            /// Construct destination path: destination_prefix + tar_path
-            String destination_path = destination_prefix + filename;
-            
-            /// Write the file to destination
-            if (file_size > 0)
-            {
-                size_t buf_size = std::min<size_t>(file_size, reader->getWriteBufferSize());
-                std::unique_ptr<WriteBuffer> write_buffer;
-                
-                if (encrypted_by_disk)
-                    write_buffer = destination_disk->writeEncryptedFile(
-                        destination_path, buf_size, WriteMode::Rewrite, reader->getWriteSettings());
-                else
-                    write_buffer = destination_disk->writeFile(
-                        destination_path, buf_size, WriteMode::Rewrite, reader->getWriteSettings());
-                
-                copyData(read_buffer, *write_buffer, file_size);
-                write_buffer->finalize();
-                
-                bytes_restored += file_size;
-            }
-            else
-            {
-                /// Create empty file
-                destination_disk->createFile(destination_path);
-            }
-            
-            ++files_restored;
-            ++num_read_files;
-            num_read_bytes += file_size;
-            
-            return true; /// Continue to next file
-        });
-    
-    if (!streaming_supported)
+
+    LOG_INFO(log, "Starting single-pass tar metadata extraction");
+
+    std::map<String, String> metadata_files; /// path -> SQL content
+
+    tar_enumerator = archive_reader->firstFile();
+
+    while (tar_enumerator)
     {
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Sequential streaming not supported by archive reader");
+        const String & filename = tar_enumerator->getFileName();
+
+        /// Skip the .backup file (already consumed during open).
+        if (filename == ".backup")
+        {
+            if (!tar_enumerator->nextFile())
+            {
+                tar_enumerator.reset();
+                break;
+            }
+            continue;
+        }
+
+        /// Buffer metadata files.
+        if (filename.starts_with("metadata/") && filename.ends_with(".sql"))
+        {
+            auto read_buffer = archive_reader->readFile(std::move(tar_enumerator));
+            String sql_content;
+            readStringUntilEOF(sql_content, *read_buffer);
+            metadata_files[filename] = std::move(sql_content);
+            tar_enumerator = archive_reader->nextFile(std::move(read_buffer));
+            continue;
+        }
+
+        /// First non-metadata file — all .sql files have been read.
+        break;
     }
-    
-    LOG_INFO(log, "Sequentially restored {} files ({} bytes) from tar archive", files_restored, bytes_restored);
-    
-    return bytes_restored;
+
+    LOG_INFO(log, "Extracted {} metadata files from tar, invoking callback to create tables", metadata_files.size());
+    on_metadata_ready(std::move(metadata_files));
+
+    /// Enable sequential mode: copyFileToDisk() will advance tar_enumerator
+    /// instead of opening a new handle per file.
+    tar_sequential_mode = true;
+
+    if (tar_enumerator)
+        LOG_INFO(log, "Tar sequential mode enabled, positioned at first data file: {}", tar_enumerator->getFileName());
+    else
+        LOG_INFO(log, "Tar sequential mode enabled (no data files in archive)");
+}
+
+bool BackupImpl::advanceTarEnumeratorTo(const String & data_file_name) const
+{
+    while (tar_enumerator)
+    {
+        const String & current = tar_enumerator->getFileName();
+        if (current == data_file_name)
+            return true;
+
+        /// Not the file we want — skip it. nextFile() on the enumerator calls
+        /// archive_read_next_header() which efficiently skips unread data.
+        if (!tar_enumerator->nextFile())
+        {
+            tar_enumerator.reset();
+            return false;
+        }
+    }
+    return false;
 }
 
 }

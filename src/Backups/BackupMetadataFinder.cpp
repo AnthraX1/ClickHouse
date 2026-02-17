@@ -280,10 +280,40 @@ void BackupMetadataFinder::findTableInBackupImpl(
     if (skip_if_inner_table && BackupUtils::isInnerTable(table_name))
         return;
 
-    auto read_buffer = backup->readFile(*metadata_path);
     String create_query_str;
-    readStringUntilEOF(create_query_str, *read_buffer);
-    read_buffer.reset();
+    
+    /// Check if we have buffered metadata (for tar archives)
+    {
+        std::lock_guard lock{mutex};
+        if (buffered_metadata_files.has_value())
+        {
+            /// Use buffered metadata
+            String metadata_path_str = metadata_path->string();
+            /// Normalize path (remove leading slash if present)
+            if (metadata_path_str.starts_with("/"))
+                metadata_path_str = metadata_path_str.substr(1);
+            
+            auto it = buffered_metadata_files->find(metadata_path_str);
+            if (it != buffered_metadata_files->end())
+            {
+                create_query_str = it->second;
+            }
+            else
+            {
+                /// Fallback to reading from backup if not found in buffer
+                lock.unlock();
+                auto read_buffer = backup->readFile(*metadata_path);
+                readStringUntilEOF(create_query_str, *read_buffer);
+            }
+        }
+        else
+        {
+            /// No buffered metadata, read from backup normally
+            lock.unlock();
+            auto read_buffer = backup->readFile(*metadata_path);
+            readStringUntilEOF(create_query_str, *read_buffer);
+        }
+    }
     ParserCreateQuery create_parser;
     ASTPtr create_table_query
         = parseQuery(create_parser, create_query_str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
@@ -374,10 +404,40 @@ void BackupMetadataFinder::findDatabaseInBackupImpl(
 
     if (metadata_path)
     {
-        auto read_buffer = backup->readFile(*metadata_path);
         String create_query_str;
-        readStringUntilEOF(create_query_str, *read_buffer);
-        read_buffer.reset();
+        
+        /// Check if we have buffered metadata (for tar archives)
+        {
+            std::lock_guard lock{mutex};
+            if (buffered_metadata_files.has_value())
+            {
+                /// Use buffered metadata
+                String metadata_path_str = metadata_path->string();
+                /// Normalize path (remove leading slash if present)
+                if (metadata_path_str.starts_with("/"))
+                    metadata_path_str = metadata_path_str.substr(1);
+                
+                auto it = buffered_metadata_files->find(metadata_path_str);
+                if (it != buffered_metadata_files->end())
+                {
+                    create_query_str = it->second;
+                }
+                else
+                {
+                    /// Fallback to reading from backup if not found in buffer
+                    lock.unlock();
+                    auto read_buffer = backup->readFile(*metadata_path);
+                    readStringUntilEOF(create_query_str, *read_buffer);
+                }
+            }
+            else
+            {
+                /// No buffered metadata, read from backup normally
+                lock.unlock();
+                auto read_buffer = backup->readFile(*metadata_path);
+                readStringUntilEOF(create_query_str, *read_buffer);
+            }
+        }
         ParserCreateQuery create_parser;
         ASTPtr create_database_query
             = parseQuery(create_parser, create_query_str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
