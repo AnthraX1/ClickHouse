@@ -7,7 +7,6 @@
 #include <Backups/BackupInfo.h>
 #include <map>
 #include <mutex>
-#include <condition_variable>
 
 
 namespace DB
@@ -83,6 +82,12 @@ public:
     SizeAndChecksum getFileSizeAndChecksum(const String & file_name) const override;
     std::unique_ptr<ReadBufferFromFileBase> readFile(const String & file_name) const override;
     std::unique_ptr<ReadBufferFromFileBase> readFile(const String & file_name, const SizeAndChecksum & size_and_checksum) const override;
+    
+    /// For tar archives (non-incremental): extracts all files sequentially to the destination disk.
+    /// This is much more efficient than copyFileToDisk() which would cause O(N²) tar scans.
+    /// Returns the number of bytes copied.
+    size_t restoreFromTarArchive(DiskPtr destination_disk, const String & destination_prefix) const;
+    
     size_t copyFileToDisk(const String & file_name, DiskPtr destination_disk, const String & destination_path, WriteMode write_mode) const override;
     size_t copyFileToDisk(const SizeAndChecksum & size_and_checksum, DiskPtr destination_disk, const String & destination_path, WriteMode write_mode) const override;
     void writeFile(const BackupFileInfo & info, BackupEntryPtr entry) override;
@@ -131,10 +136,6 @@ private:
     /// Checks if the archive is a tar format (which benefits from sequential reading)
     bool isTarArchive() const;
 
-    /// For tar archives: performs a single sequential pass to copy all pending files to their destinations.
-    /// This avoids O(N²) complexity of repeated sequential scans through the tar archive.
-    void copyPendingFilesFromTarSequentially() const TSA_REQUIRES(mutex);
-
     const BackupFactory::CreateParams params;
     BackupInfo backup_info;
     const String backup_name_for_logging;
@@ -157,7 +158,6 @@ private:
     std::shared_ptr<IBackupCoordination> coordination;
 
     mutable std::mutex mutex;
-    mutable std::condition_variable tar_copy_cv; /// For coordinating tar sequential copy between threads
 
     using SizeAndChecksum = std::pair<UInt64, UInt128>;
     std::map<String /* file_name */, SizeAndChecksum> file_names TSA_GUARDED_BY(mutex); /// Should be ordered alphabetically, see listFiles(). For empty files we assume checksum = 0.
@@ -185,18 +185,6 @@ private:
     std::shared_ptr<IArchiveWriter> archive_writer;
     String lock_file_name;
     std::atomic<bool> lock_file_before_first_file_checked = false;
-    
-    /// For tar archive optimization: tracks files that need to be copied and their destinations
-    struct PendingFileRestore
-    {
-        DiskPtr destination_disk;
-        String destination_path;
-        WriteMode write_mode;
-        BackupFileInfo info;
-    };
-    mutable bool tar_sequential_copy_in_progress = false TSA_GUARDED_BY(mutex); /// True while one thread is doing sequential copy
-    mutable bool tar_sequential_copy_done = false TSA_GUARDED_BY(mutex); /// True after sequential copy completes
-    mutable std::unordered_map<String, PendingFileRestore> tar_pending_files TSA_GUARDED_BY(mutex);
 
     bool writing_finalized = false;
     bool corrupted = false;

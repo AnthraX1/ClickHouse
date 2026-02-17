@@ -942,47 +942,6 @@ size_t BackupImpl::copyFileToDisk(const SizeAndChecksum & size_and_checksum,
             info.data_file_name);
     }
 
-    /// Optimization for tar archives without base backup: do a single sequential pass
-    /// to copy all files from the archive in ONE thread to avoid O(N²) complexity.
-    if (use_archive && isTarArchive() && !has_base_backup && info.size > info.base_size)
-    {
-        std::unique_lock lock{mutex};
-        
-        /// Add this file to the pending list
-        PendingFileRestore pending;
-        pending.destination_disk = destination_disk;
-        pending.destination_path = destination_path;
-        pending.write_mode = write_mode;
-        pending.info = info;
-        tar_pending_files[info.data_file_name] = std::move(pending);
-        
-        /// If sequential copy hasn't started and isn't done, start it
-        if (!tar_sequential_copy_done && !tar_sequential_copy_in_progress)
-        {
-            /// This thread will perform the sequential copy
-            tar_sequential_copy_in_progress = true;
-            
-            /// Perform sequential copy in this thread only
-            copyPendingFilesFromTarSequentially();
-            
-            tar_sequential_copy_done = true;
-            tar_sequential_copy_in_progress = false;
-            
-            /// Notify any waiting threads (though in practice there shouldn't be many)
-            tar_copy_cv.notify_all();
-        }
-        else if (tar_sequential_copy_in_progress)
-        {
-            /// Another thread is doing the sequential copy, wait for it to complete
-            tar_copy_cv.wait(lock, [this] { return tar_sequential_copy_done; });
-        }
-        
-        /// After sequential copy completes, the file is already written
-        ++num_read_files;
-        num_read_bytes += info.size;
-        return info.size;
-    }
-
     bool file_copied = false;
 
     if (info.size && !info.base_size && !use_archive)
@@ -1258,11 +1217,17 @@ bool BackupImpl::isTarArchive() const
     return use_archive && hasSupportedTarExtension(archive_params.archive_name);
 }
 
-void BackupImpl::copyPendingFilesFromTarSequentially() const
+size_t BackupImpl::restoreFromTarArchive(DiskPtr destination_disk, const String & destination_prefix) const
 {
-    /// This method copies all pending files from a tar archive in a single sequential pass.
-    /// For tar archives, each random file access requires scanning from the beginning,
-    /// resulting in O(N²) total time. Sequential streaming achieves O(N) complexity.
+    /// This method provides a dedicated restore path for tar archives that uses
+    /// LibArchiveReader to sequentially extract files directly to their destinations.
+    /// This avoids O(N²) complexity of repeated sequential scans through the tar archive.
+    ///
+    /// The tar archive contains files with paths like:
+    ///   - metadata/database/table.sql
+    ///   - data/database/table/part/data.bin
+    /// 
+    /// We extract each file to: destination_disk/destination_prefix/{tar_path}
     ///
     /// Safety considerations:
     /// 1. The .backup metadata file checksums are NEVER verified against actual file data during restore.
@@ -1270,26 +1235,25 @@ void BackupImpl::copyPendingFilesFromTarSequentially() const
     /// 2. Encrypted files work because we do byte-level copy without decryption during restore.
     ///    The encrypted_by_disk flag only controls whether writeEncryptedFile() vs writeFile() is called.
     /// 3. For non-incremental backups (no base backup), all data comes from this archive.
-    ///    The tar entry paths encode the full database/table/part/filename structure.
     
-    if (tar_sequential_copy_done)
-        return; /// Already done
+    if (open_mode == OpenMode::WRITE)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot restore from a backup opened for writing");
+    
+    if (!use_archive || !isTarArchive())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "restoreFromTarArchive() called on non-tar backup");
+    
+    if (has_base_backup)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "restoreFromTarArchive() does not support incremental backups");
     
     if (!archive_reader)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Archive reader is not initialized");
     
-    if (tar_pending_files.empty())
-    {
-        tar_sequential_copy_done = true;
-        return; /// Nothing to copy
-    }
+    LOG_INFO(log, "Starting sequential tar restore to {}{}", destination_disk->getName(), destination_prefix);
     
-    LOG_TRACE(log, "Starting sequential copy of {} files from tar archive", tar_pending_files.size());
+    size_t files_restored = 0;
+    size_t bytes_restored = 0;
     
-    size_t files_copied = 0;
-    size_t bytes_copied = 0;
-    
-    /// Use streamAllFiles to iterate through the archive sequentially
+    /// Use streamAllFiles to iterate through the tar archive sequentially (single pass)
     bool streaming_supported = archive_reader->streamAllFiles(
         [&](const String & filename, ReadBuffer & read_buffer) -> bool
         {
@@ -1297,30 +1261,67 @@ void BackupImpl::copyPendingFilesFromTarSequentially() const
             if (filename == ".backup")
                 return true; /// Continue to next file
             
-            /// Check if this file is in our pending list
-            auto it = tar_pending_files.find(filename);
-            if (it == tar_pending_files.end())
-                return true; /// Not a file we need to copy, skip it
+            /// Look up the file in our metadata to get size and encryption info
+            std::lock_guard lock{mutex};
             
-            const auto & pending = it->second;
-            const auto & info = pending.info;
+            auto name_it = file_names.find(filename);
+            if (name_it == file_names.end())
+            {
+                LOG_WARNING(log, "File {} found in tar but not in backup metadata, skipping", filename);
+                return true;
+            }
             
-            /// Copy the file data from the archive to the destination disk
-            std::unique_ptr<WriteBuffer> write_buffer;
-            size_t buf_size = std::min<size_t>(info.size, reader->getWriteBufferSize());
+            const auto & size_and_checksum = name_it->second;
+            UInt64 file_size = size_and_checksum.first;
             
-            if (info.encrypted_by_disk)
-                write_buffer = pending.destination_disk->writeEncryptedFile(
-                    pending.destination_path, buf_size, pending.write_mode, reader->getWriteSettings());
+            /// Get file info for encryption flag
+            bool encrypted_by_disk = false;
+            if (file_size > 0)
+            {
+                auto info_it = file_infos.find(size_and_checksum);
+                if (info_it != file_infos.end())
+                    encrypted_by_disk = info_it->second.encrypted_by_disk;
+            }
+            
+            /// Check encryption compatibility
+            if (encrypted_by_disk && !destination_disk->getDataSourceDescription().is_encrypted)
+            {
+                throw Exception(
+                    ErrorCodes::CANNOT_RESTORE_TO_NONENCRYPTED_DISK,
+                    "File {} is encrypted in the backup, it can be restored only to an encrypted disk",
+                    filename);
+            }
+            
+            /// Construct destination path: destination_prefix + tar_path
+            String destination_path = destination_prefix + filename;
+            
+            /// Write the file to destination
+            if (file_size > 0)
+            {
+                size_t buf_size = std::min<size_t>(file_size, reader->getWriteBufferSize());
+                std::unique_ptr<WriteBuffer> write_buffer;
+                
+                if (encrypted_by_disk)
+                    write_buffer = destination_disk->writeEncryptedFile(
+                        destination_path, buf_size, WriteMode::Rewrite, reader->getWriteSettings());
+                else
+                    write_buffer = destination_disk->writeFile(
+                        destination_path, buf_size, WriteMode::Rewrite, reader->getWriteSettings());
+                
+                copyData(read_buffer, *write_buffer, file_size);
+                write_buffer->finalize();
+                
+                bytes_restored += file_size;
+            }
             else
-                write_buffer = pending.destination_disk->writeFile(
-                    pending.destination_path, buf_size, pending.write_mode, reader->getWriteSettings());
+            {
+                /// Create empty file
+                destination_disk->createFile(destination_path);
+            }
             
-            copyData(read_buffer, *write_buffer, info.size);
-            write_buffer->finalize();
-            
-            ++files_copied;
-            bytes_copied += info.size;
+            ++files_restored;
+            ++num_read_files;
+            num_read_bytes += file_size;
             
             return true; /// Continue to next file
         });
@@ -1332,8 +1333,9 @@ void BackupImpl::copyPendingFilesFromTarSequentially() const
             "Sequential streaming not supported by archive reader");
     }
     
-    tar_sequential_copy_done = true;
-    LOG_TRACE(log, "Sequentially copied {} files ({} bytes) from tar archive", files_copied, bytes_copied);
+    LOG_INFO(log, "Sequentially restored {} files ({} bytes) from tar archive", files_restored, bytes_restored);
+    
+    return bytes_restored;
 }
 
 }
