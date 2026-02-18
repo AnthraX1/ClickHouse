@@ -5,6 +5,8 @@
 #include <Backups/IBackup.h>
 #include <Backups/IBackupCoordination.h>
 #include <Backups/BackupInfo.h>
+#include <IO/Archives/IArchiveReader.h>
+#include <functional>
 #include <map>
 #include <mutex>
 
@@ -15,7 +17,6 @@ class IBackupCoordination;
 class IBackupReader;
 class IBackupWriter;
 class SeekableReadBuffer;
-class IArchiveReader;
 class IArchiveWriter;
 
 /// Implementation of IBackup.
@@ -82,6 +83,18 @@ public:
     SizeAndChecksum getFileSizeAndChecksum(const String & file_name) const override;
     std::unique_ptr<ReadBufferFromFileBase> readFile(const String & file_name) const override;
     std::unique_ptr<ReadBufferFromFileBase> readFile(const String & file_name, const SizeAndChecksum & size_and_checksum) const override;
+    
+    /// For tar archives: single-pass sequential restore.
+    ///
+    /// Streams through the tar archive reading metadata (.sql) files first.
+    /// When the first data file is encountered, calls on_metadata_ready with the
+    /// buffered metadata so the caller can create databases and tables.
+    /// After this call returns, the tar is positioned at the first data file and
+    /// subsequent copyFileToDisk() calls will read sequentially (O(N) total)
+    /// instead of seeking from the beginning each time (O(N²)).
+    using MetadataReadyCallback = std::function<void(std::map<String, String> && metadata_files)>;
+    void restoreFromTarArchive(MetadataReadyCallback on_metadata_ready) const;
+    
     size_t copyFileToDisk(const String & file_name, DiskPtr destination_disk, const String & destination_path, WriteMode write_mode) const override;
     size_t copyFileToDisk(const SizeAndChecksum & size_and_checksum, DiskPtr destination_disk, const String & destination_path, WriteMode write_mode) const override;
     void writeFile(const BackupFileInfo & info, BackupEntryPtr entry) override;
@@ -127,6 +140,9 @@ private:
     std::unique_ptr<ReadBufferFromFileBase>
     readFileImpl(const String & file_name, const SizeAndChecksum & size_and_checksum, bool read_encrypted) const;
 
+    /// Checks if the archive is a tar format (which benefits from sequential reading)
+    bool isTarArchive() const;
+
     const BackupFactory::CreateParams params;
     BackupInfo backup_info;
     const String backup_name_for_logging;
@@ -171,10 +187,23 @@ private:
     mutable std::optional<BackupInfo> base_backup_info;
     mutable std::shared_ptr<const IBackup> base_backup;
     mutable std::optional<UUID> base_backup_uuid;
+    bool has_base_backup = false; /// Set during readBackupMetadata() if base_backup_info is present
     std::shared_ptr<IArchiveReader> archive_reader;
     std::shared_ptr<IArchiveWriter> archive_writer;
     String lock_file_name;
     std::atomic<bool> lock_file_before_first_file_checked = false;
+    
+    /// Sequential tar reading state.
+    /// When tar_sequential_mode is true, copyFileToDisk() reads from the shared
+    /// enumerator instead of opening a new archive handle for each file.
+    /// Only valid during single-threaded tar restore (guaranteed by RestorerFromBackup).
+    mutable std::unique_ptr<IArchiveReader::FileEnumerator> tar_enumerator;
+    mutable bool tar_sequential_mode = false;
+
+    /// Advance the tar enumerator forward until it reaches the named file.
+    /// Returns true if found (enumerator positioned at the file), false if
+    /// end-of-archive was reached (enumerator becomes null).
+    bool advanceTarEnumeratorTo(const String & data_file_name) const;
 
     bool writing_finalized = false;
     bool corrupted = false;

@@ -2,6 +2,7 @@
 #include <Access/AccessRights.h>
 #include <Access/ContextAccess.h>
 #include <Backups/BackupCoordinationStage.h>
+#include <Backups/BackupImpl.h>
 #include <Backups/BackupMetadataFinder.h>
 #include <Backups/BackupSettings.h>
 #include <Backups/BackupUtils.h>
@@ -135,32 +136,81 @@ void RestorerFromBackup::run(Mode mode_)
     /// Calculate the root path in the backup for restoring, it's either empty or has the format "shards/<shard_num>/replicas/<replica_num>/".
     findRootPathsInBackup();
 
-    /// Find all the databases and tables which we will read from the backup.
-    setStage(Stage::FINDING_TABLES_IN_BACKUP);
-    findDatabasesAndTablesInBackup();
-    logNumberOfDatabasesAndTablesToRestore();
+    /// Check if this is a tar archive backup - if so, use single-pass sequential extraction
+    const BackupImpl * backup_impl = dynamic_cast<const BackupImpl *>(backup.get());
+    is_tar_archive = backup_impl && backup_impl->isTarArchive();
 
-    /// Check access rights.
-    setStage(Stage::CHECKING_ACCESS_RIGHTS);
-    loadSystemAccessTables();
-    checkAccessForObjectsFoundInBackup();
+    if (is_tar_archive)
+    {
+        /// Single-pass tar restore:
+        ///  1. Stream metadata (.sql) files sequentially from the tar archive.
+        ///  2. At the metadata→data boundary, create databases and tables.
+        ///  3. The tar enumerator is left positioned at the first data file.
+        ///  4. Storage engines call copyFileToDisk() which now advances the same
+        ///     enumerator — reading each data file exactly once, O(N) total.
 
-    if (mode == Mode::CHECK_ACCESS_ONLY)
-        return;
+        setStage(Stage::FINDING_TABLES_IN_BACKUP, "Starting single-pass tar restore");
 
-    /// Create databases using the create queries read from the backup.
-    setStage(Stage::CREATING_DATABASES);
-    createAndCheckDatabases();
+        backup_impl->restoreFromTarArchive(
+            [&](std::map<String, String> && metadata_files)
+            {
+                {
+                    std::lock_guard lock{mutex};
+                    buffered_metadata_files = std::move(metadata_files);
+                }
 
-    /// Create tables using the create queries read from the backup.
-    setStage(Stage::CREATING_TABLES);
-    removeUnresolvedDependencies();
-    createAndCheckTables();
+                findDatabasesAndTablesInBackup();
+                logNumberOfDatabasesAndTablesToRestore();
 
-    /// All what's left is to insert data to tables.
-    setStage(Stage::INSERTING_DATA_TO_TABLES);
-    insertDataToTables();
-    runDataRestoreTasks();
+                setStage(Stage::CHECKING_ACCESS_RIGHTS);
+                loadSystemAccessTables();
+                checkAccessForObjectsFoundInBackup();
+
+                if (mode == Mode::CHECK_ACCESS_ONLY)
+                    return;
+
+                setStage(Stage::CREATING_DATABASES);
+                createAndCheckDatabases();
+
+                setStage(Stage::CREATING_TABLES);
+                removeUnresolvedDependencies();
+                createAndCheckTables();
+            });
+
+        if (mode == Mode::CHECK_ACCESS_ONLY)
+            return;
+
+        /// Data restore: storage engines call copyFileToDisk() which reads
+        /// sequentially from the tar (O(N) via the shared enumerator).
+        setStage(Stage::INSERTING_DATA_TO_TABLES);
+        insertDataToTables();
+        runDataRestoreTasks();
+    }
+    else
+    {
+        /// Non-tar archives: use the normal parallel restore path.
+        setStage(Stage::FINDING_TABLES_IN_BACKUP);
+        findDatabasesAndTablesInBackup();
+        logNumberOfDatabasesAndTablesToRestore();
+
+        setStage(Stage::CHECKING_ACCESS_RIGHTS);
+        loadSystemAccessTables();
+        checkAccessForObjectsFoundInBackup();
+
+        if (mode == Mode::CHECK_ACCESS_ONLY)
+            return;
+
+        setStage(Stage::CREATING_DATABASES);
+        createAndCheckDatabases();
+
+        setStage(Stage::CREATING_TABLES);
+        removeUnresolvedDependencies();
+        createAndCheckTables();
+
+        setStage(Stage::INSERTING_DATA_TO_TABLES);
+        insertDataToTables();
+        runDataRestoreTasks();
+    }
 
     setStage(Stage::FINALIZING_TABLES);
     finalizeTables();
@@ -800,7 +850,9 @@ void RestorerFromBackup::insertDataToTables()
     for (const auto & table_name : table_names)
         insertDataToTable(table_name);
 
-    waitFutures();
+    /// Only wait for futures if not tar archive (tar archive executes sequentially)
+    if (!is_tar_archive)
+        waitFutures();
 }
 
 void RestorerFromBackup::insertDataToTable(const QualifiedTableName & table_name)
@@ -819,9 +871,17 @@ void RestorerFromBackup::insertDataToTable(const QualifiedTableName & table_name
         partitions = table_info.partitions;
     }
 
-    schedule(
-        [this, table_name, storage, data_path_in_backup, partitions]() { insertDataToTableImpl(table_name, storage, data_path_in_backup, partitions); },
-        ThreadName::RESTORE_TABLE_DATA);
+    /// For tar archives, execute sequentially to avoid concurrent access to sequential tar reader
+    if (is_tar_archive)
+    {
+        insertDataToTableImpl(table_name, storage, data_path_in_backup, partitions);
+    }
+    else
+    {
+        schedule(
+            [this, table_name, storage, data_path_in_backup, partitions]() { insertDataToTableImpl(table_name, storage, data_path_in_backup, partitions); },
+            ThreadName::RESTORE_TABLE_DATA);
+    }
 }
 
 void RestorerFromBackup::insertDataToTableImpl(const QualifiedTableName & table_name, StoragePtr storage, const String & data_path_in_backup, const std::optional<ASTs> & partitions)
@@ -876,10 +936,19 @@ void RestorerFromBackup::runDataRestoreTasks()
         if (tasks_to_run.empty())
             break;
 
-        for (auto & task : tasks_to_run)
-            schedule(std::move(task), ThreadName::RESTORE_TABLE_TASK);
+        /// For tar archives, execute tasks sequentially to avoid concurrent access to sequential tar reader
+        if (is_tar_archive)
+        {
+            for (auto & task : tasks_to_run)
+                task();
+        }
+        else
+        {
+            for (auto & task : tasks_to_run)
+                schedule(std::move(task), ThreadName::RESTORE_TABLE_TASK);
 
-        waitFutures();
+            waitFutures();
+        }
     }
 }
 

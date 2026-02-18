@@ -78,6 +78,9 @@ private:
     const ZooKeeperRetriesInfo zookeeper_retries_info;
     Mode mode = Mode::RESTORE;
     Strings all_hosts;
+    
+    /// Flag to track if this is a tar archive backup (requires single-threaded restore)
+    bool is_tar_archive = false;
 
     void findDatabasesAndTablesInBackup();
 
